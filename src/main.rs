@@ -11,13 +11,11 @@ static DEBUG: bool = false;
 const BUF_SIZE: usize = 2048;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let forwards = vec![
-        (
-            String::from("127.0.0.1:7878"),
-            String::from("127.0.0.1:7979"),
-        )
-    ];
+async fn main() -> Result<(), BoxedError> {
+    let forwards = vec![(
+        String::from("127.0.0.1:7878"),
+        String::from("127.0.0.1:7979"),
+    )];
     let mut handles = vec![];
 
     for (from, to) in forwards {
