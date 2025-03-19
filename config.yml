@@ -1,0 +1,5 @@
+debug: false
+forward:
+  - name: "Server 1"
+    listen-address: "127.0.0.1:8000"
+    forward-address: "127.0.0.1:9000"

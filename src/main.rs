@@ -1,3 +1,6 @@
+mod config;
+
+use crate::config::Server;
 use futures::FutureExt;
 use std::error::Error;
 use std::net::SocketAddr;
@@ -7,20 +10,16 @@ use tokio::sync::broadcast;
 use tokio::task;
 
 type BoxedError = Box<dyn Error + Sync + Send + 'static>;
-static DEBUG: bool = false;
 const BUF_SIZE: usize = 2048;
 
 #[tokio::main]
 async fn main() -> Result<(), BoxedError> {
-    let forwards = vec![(
-        String::from("127.0.0.1:7878"),
-        String::from("127.0.0.1:7979"),
-    )];
+    config::init_config();
     let mut handles = vec![];
-
-    for (from, to) in forwards {
+    let servers = &config::get_config().forward;
+    for server in servers.iter() {
         let handle = task::spawn(async move {
-            if let Err(e) = forward(from, to).await {
+            if let Err(e) = forward(&server).await {
                 eprintln!("Error in forward: {}", e);
             }
         });
@@ -34,21 +33,23 @@ async fn main() -> Result<(), BoxedError> {
     Ok(())
 }
 
-async fn forward(bind_ip: String, remote: String) -> Result<(), BoxedError> {
-    let bind_sock = bind_ip
+async fn forward(server: &Server) -> Result<(), BoxedError> {
+    let bind_sock = server
+        .listen_address
         .parse::<SocketAddr>()
         .expect("Failed to parse bind address");
     let listener = TcpListener::bind(&bind_sock).await?;
     println!(
-        "Forwarding {} to {}",
+        "Forwarding {} to {} ({})",
         listener.local_addr().unwrap(),
-        remote
+        server.forward_address,
+        server.name
     );
 
     // We leak `remote` instead of wrapping it in an Arc to share it with future tasks since
     // `remote` is going to live for the lifetime of the server in all cases.
     // (This reduces MESI/MOESI cache traffic between CPU cores.)
-    let remote: &str = Box::leak(remote.into_boxed_str());
+    let remote: &str = Box::leak(server.forward_address.clone().into_boxed_str());
 
     loop {
         let (mut client, client_addr) = listener.accept().await?;
@@ -77,7 +78,7 @@ async fn forward(bind_ip: String, remote: String) -> Result<(), BoxedError> {
 
             match client_copied {
                 Ok(count) => {
-                    if DEBUG {
+                    if config::get_config().debug {
                         eprintln!(
                             "Transferred {} bytes from proxy client {} to upstream server",
                             count, client_addr
@@ -95,7 +96,7 @@ async fn forward(bind_ip: String, remote: String) -> Result<(), BoxedError> {
 
             match remote_copied {
                 Ok(count) => {
-                    if DEBUG {
+                    if config::get_config().debug {
                         eprintln!(
                             "Transferred {} bytes from upstream server to proxy client {}",
                             count, client_addr
