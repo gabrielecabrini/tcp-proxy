@@ -15,12 +15,13 @@ const BUF_SIZE: usize = 2048;
 #[tokio::main]
 async fn main() -> Result<(), BoxedError> {
     config::init_config();
-    let mut handles = vec![];
+    let mut handles = Vec::new();
     let servers = &config::get_config().forward;
     for server in servers.iter() {
         let handle = task::spawn(async move {
-            if let Err(e) = forward(&server).await {
-                eprintln!("Error in forward: {}", e);
+            let server_name = &server.name;
+            if let Err(e) = setup_forward(server).await {
+                eprintln!("Error in forward server {}: {}", server_name, e);
             }
         });
         handles.push(handle);
@@ -33,7 +34,7 @@ async fn main() -> Result<(), BoxedError> {
     Ok(())
 }
 
-async fn forward(server: &Server) -> Result<(), BoxedError> {
+async fn setup_forward(server: &Server) -> Result<(), BoxedError> {
     let bind_sock = server
         .listen_address
         .parse::<SocketAddr>()
@@ -46,22 +47,25 @@ async fn forward(server: &Server) -> Result<(), BoxedError> {
         server.name
     );
 
-    // We leak `remote` instead of wrapping it in an Arc to share it with future tasks since
-    // `remote` is going to live for the lifetime of the server in all cases.
-    // (This reduces MESI/MOESI cache traffic between CPU cores.)
+    // We leak instead of wrapping it in an Arc to share it with future tasks since
+    // this is going to live for the lifetime of the server in all cases.
     let remote: &str = Box::leak(server.forward_address.clone().into_boxed_str());
+    let server_name: &str = Box::leak(server.name.clone().into_boxed_str());
 
     loop {
         let (mut client, client_addr) = listener.accept().await?;
 
         tokio::spawn(async move {
-            println!("New connection from {}", client_addr);
+            println!(
+                "New connection from {} (forwarding to {})",
+                client_addr, server_name
+            );
 
             // Establish connection to upstream for each incoming client connection
             let mut remote = match TcpStream::connect(remote).await {
                 Ok(result) => result,
                 Err(e) => {
-                    eprintln!("Error establishing upstream connection: {e}");
+                    eprintln!("Error establishing upstream connection to ({server_name}): {e}");
                     return;
                 }
             };
@@ -80,14 +84,14 @@ async fn forward(server: &Server) -> Result<(), BoxedError> {
                 Ok(count) => {
                     if config::get_config().debug {
                         eprintln!(
-                            "Transferred {} bytes from proxy client {} to upstream server",
+                            "Transferred {} bytes from proxy client {} to upstream server ({server_name})",
                             count, client_addr
                         );
                     }
                 }
                 Err(err) => {
                     eprintln!(
-                        "Error writing bytes from proxy client {} to upstream server",
+                        "Error writing bytes from proxy client {} to upstream server ({server_name})",
                         client_addr
                     );
                     eprintln!("{}", err);
@@ -98,15 +102,15 @@ async fn forward(server: &Server) -> Result<(), BoxedError> {
                 Ok(count) => {
                     if config::get_config().debug {
                         eprintln!(
-                            "Transferred {} bytes from upstream server to proxy client {}",
+                            "Transferred {} bytes from upstream server ({server_name}) to proxy client {}",
                             count, client_addr
                         );
                     }
-                    println!("Closed connection of {}", client_addr);
+                    println!("Closed connection of {} ({server_name})", client_addr);
                 }
                 Err(err) => {
                     eprintln!(
-                        "Error writing from upstream server to proxy client {}!",
+                        "Error writing from upstream server ({server_name}) to proxy client {}!",
                         client_addr
                     );
                     eprintln!("{}", err);
