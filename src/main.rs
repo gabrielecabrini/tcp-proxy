@@ -1,27 +1,27 @@
 mod config;
 
 use crate::config::Server;
-use futures::FutureExt;
 use std::error::Error;
 use std::net::SocketAddr;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::sync::Arc;
+use tokio::io::{AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
 use tokio::task;
 
 type BoxedError = Box<dyn Error + Sync + Send + 'static>;
-const BUF_SIZE: usize = 2048;
 
 #[tokio::main]
 async fn main() -> Result<(), BoxedError> {
     config::init_config();
-    let mut handles = Vec::new();
     let servers = &config::get_config().forward;
+
+    let mut handles = Vec::new();
+
     for server in servers.iter() {
+        let server = server.clone();
         let handle = task::spawn(async move {
-            let server_name = &server.name;
-            if let Err(e) = setup_forward(server).await {
-                eprintln!("Error in forward server {}: {}", server_name, e);
+            if let Err(e) = setup_forward(&server).await {
+                eprintln!("Error in forward server {}: {}", server.name, e);
             }
         });
         handles.push(handle);
@@ -35,130 +35,46 @@ async fn main() -> Result<(), BoxedError> {
 }
 
 async fn setup_forward(server: &Server) -> Result<(), BoxedError> {
-    let bind_sock = server
+    let bind_addr: SocketAddr = server
         .listen_address
-        .parse::<SocketAddr>()
+        .parse()
         .expect("Failed to parse bind address");
-    let listener = TcpListener::bind(&bind_sock).await?;
+
+    let listener = TcpListener::bind(&bind_addr).await?;
     println!(
         "Forwarding {} to {} ({})",
-        listener.local_addr().unwrap(),
+        listener.local_addr()?,
         server.forward_address,
         server.name
     );
 
-    // We leak instead of wrapping it in an Arc to share it with future tasks since
-    // this is going to live for the lifetime of the server in all cases.
-    let remote: &str = Box::leak(server.forward_address.clone().into_boxed_str());
-    let server_name: &str = Box::leak(server.name.clone().into_boxed_str());
+    let remote = Arc::new(server.forward_address.clone());
+    let server_name = Arc::new(server.name.clone());
 
     loop {
         let (mut client, client_addr) = listener.accept().await?;
+        let remote = remote.clone();
+        let server_name = server_name.clone();
 
         tokio::spawn(async move {
-            println!(
-                "New connection from {} (forwarding to {})",
-                client_addr, server_name
-            );
+            println!("New connection from {} (forwarding to {})", client_addr, server_name);
 
-            // Establish connection to upstream for each incoming client connection
-            let mut remote = match TcpStream::connect(remote).await {
-                Ok(result) => result,
-                Err(e) => {
-                    eprintln!("Error establishing upstream connection to ({server_name}): {e}");
-                    return;
-                }
-            };
-            let (mut client_read, mut client_write) = client.split();
-            let (mut remote_read, mut remote_write) = remote.split();
-
-            let (cancel, _) = broadcast::channel::<()>(1);
-            let (remote_copied, client_copied) = tokio::join! {
-                copy_with_abort(&mut remote_read, &mut client_write, cancel.subscribe())
-                    .then(|r| { let _ = cancel.send(()); async { r } }),
-                copy_with_abort(&mut client_read, &mut remote_write, cancel.subscribe())
-                    .then(|r| { let _ = cancel.send(()); async { r } }),
-            };
-
-            match client_copied {
-                Ok(count) => {
-                    if config::get_config().debug {
-                        eprintln!(
-                            "Transferred {} bytes from proxy client {} to upstream server ({server_name})",
-                            count, client_addr
-                        );
+            match TcpStream::connect(&*remote).await {
+                Ok(mut upstream) => {
+                    if let Err(e) = copy_bidirectional(&mut client, &mut upstream).await {
+                        eprintln!("Error during forwarding ({server_name}): {e}");
                     }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "Error writing bytes from proxy client {} to upstream server ({server_name})",
-                        client_addr
-                    );
-                    eprintln!("{}", err);
-                }
-            };
 
-            match remote_copied {
-                Ok(count) => {
-                    if config::get_config().debug {
-                        eprintln!(
-                            "Transferred {} bytes from upstream server ({server_name}) to proxy client {}",
-                            count, client_addr
-                        );
-                    }
+                    // Close both ends explicitly
+                    let _ = client.shutdown().await;
+                    let _ = upstream.shutdown().await;
+
                     println!("Closed connection of {} ({server_name})", client_addr);
                 }
-                Err(err) => {
-                    eprintln!(
-                        "Error writing from upstream server ({server_name}) to proxy client {}!",
-                        client_addr
-                    );
-                    eprintln!("{}", err);
+                Err(e) => {
+                    eprintln!("Error connecting to upstream ({server_name}): {e}");
                 }
-            };
+            }
         });
-    }
-
-    // Two instances of this function are spawned for each half of the connection: client-to-server,
-    // server-to-client.
-    async fn copy_with_abort<R, W>(
-        read: &mut R,
-        write: &mut W,
-        mut abort: broadcast::Receiver<()>,
-    ) -> tokio::io::Result<usize>
-    where
-        R: AsyncRead + Unpin,
-        W: AsyncWrite + Unpin,
-    {
-        let mut copied = 0;
-        let mut buf = [0u8; BUF_SIZE];
-        loop {
-            let bytes_read;
-            tokio::select! {
-                biased;
-
-                result = read.read(&mut buf) => {
-                    use std::io::ErrorKind::{ConnectionReset, ConnectionAborted};
-                    bytes_read = result.or_else(|e| match e.kind() {
-                        // Consider these to be part of the proxy life, not errors
-                        ConnectionReset | ConnectionAborted => Ok(0),
-                        _ => Err(e)
-                    })?;
-                },
-                _ = abort.recv() => {
-                    break;
-                }
-            }
-
-            if bytes_read == 0 {
-                break;
-            }
-
-            // any error writing data we've already read to the other side is treated as exceptional.
-            write.write_all(&buf[0..bytes_read]).await?;
-            copied += bytes_read;
-        }
-
-        Ok(copied)
     }
 }

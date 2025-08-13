@@ -16,6 +16,7 @@ pub struct Settings {
 }
 
 #[derive(Debug, Deserialize)]
+#[derive(Clone)]
 pub struct Server {
     pub name: String,
     #[serde(rename = "listen-address")]
